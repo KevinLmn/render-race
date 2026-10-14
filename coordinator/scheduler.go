@@ -192,12 +192,13 @@ func (r *Race) tile(jobID, id int) Tile {
 func (j *Job) done() bool { return j.doneCount == j.race.Total }
 
 type Scheduler struct {
-	mu      sync.Mutex
-	hub     *Hub
-	race    *Race
-	jobs    map[int]*Job
-	nextID  int
-	workers map[string]*Worker
+	mu       sync.Mutex
+	hub      *Hub
+	race     *Race
+	jobs     map[int]*Job
+	nextID   int
+	workers  map[string]*Worker
+	wakeable []string // machines the coordinator can wake with a magic packet
 	// Closed and replaced on every state change, to wake up long-polling workers.
 	changed chan struct{}
 }
@@ -457,7 +458,7 @@ func (s *Scheduler) workersMessageLocked() message {
 		list = append(list, w)
 	}
 	sort.Slice(list, func(a, b int) bool { return list[a].Index < list[b].Index })
-	return jsonMessage(map[string]any{"type": "workers", "workers": list})
+	return jsonMessage(map[string]any{"type": "workers", "workers": list, "wakeable": s.wakeable})
 }
 
 func (s *Scheduler) broadcastProgressLocked(j *Job) {

@@ -8,6 +8,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COORD_IP=100.64.0.1 # mini, Tailscale
+# The mini wakes the PC from sleep: its Ethernet MAC and the LAN broadcast address.
+WAKE="pc=00:11:22:33:44:55@192.168.1.255"
 COORD="http://$COORD_IP:8787"
 WSL='"C:\Program Files\WSL\wsl.exe" -d Ubuntu-24.04 --'
 
@@ -73,7 +75,7 @@ mini_setup() {
   local R=$HOME/render-race args=(--coordinator "$COORD" --machine mini --threads 10)
   echo 'set -euo pipefail; mkdir -p ~/Library/LaunchAgents'
   # Bound to the Tailscale IP only: reachable from the fleet, not from the LAN.
-  for spec in "coordinator|$R/coordinator -addr $COORD_IP:8787" \
+  for spec in "coordinator|$R/coordinator -addr $COORD_IP:8787 -wake $WAKE" \
     "worker-rust|$R/worker-rust ${args[*]}" \
     "worker-go|$R/worker-go ${args[*]}" \
     "worker-js|$HOME/.local/node/bin/node $R/worker.mjs ${args[*]}"; do

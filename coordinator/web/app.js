@@ -141,14 +141,14 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') return onTile(e.data)
     const msg = JSON.parse(e.data)
-    if (msg.type === 'workers') onWorkers(msg.workers)
+    if (msg.type === 'workers') onWorkers(msg.workers, msg.wakeable ?? [])
     else if (msg.type === 'race') onRace(msg.race)
     else if (msg.type === 'progress') onProgress(msg)
   }
 }
 connect()
 
-function onWorkers(workers) {
+function onWorkers(workers, wakeable) {
   state.workers = []
   for (const w of workers) {
     state.workers[w.index] = w
@@ -176,6 +176,21 @@ function onWorkers(workers) {
     }),
   )
   $('no-workers').hidden = workers.some((w) => w.online)
+
+  // Machines the coordinator can wake (Wake-on-LAN) and that have no worker online.
+  const asleep = wakeable.filter((m) => !workers.some((w) => w.machine === m && w.online))
+  $('wake').replaceChildren(
+    ...asleep.map((machine) => {
+      const btn = document.createElement('button')
+      btn.textContent = `Réveiller ${machine}`
+      btn.addEventListener('click', async () => {
+        btn.disabled = true
+        const res = await fetch(`/api/wake?machine=${encodeURIComponent(machine)}`, { method: 'POST' })
+        btn.textContent = res.ok ? `Paquet envoyé, ${machine} démarre…` : `Échec du réveil (${res.status})`
+      })
+      return btn
+    }),
+  )
 }
 
 function onRace(race) {

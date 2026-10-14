@@ -21,10 +21,18 @@ var webFS embed.FS
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
+	wake := flag.String("wake", "", "machines that can be woken up: machine=mac@broadcast,...")
 	flag.Parse()
+	wakeTargets, err := parseWakeTargets(*wake)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	hub := NewHub()
 	sched := NewScheduler(hub)
+	for machine := range wakeTargets {
+		sched.wakeable = append(sched.wakeable, machine)
+	}
 	go sched.Run()
 
 	static, err := fs.Sub(webFS, "web")
@@ -57,6 +65,21 @@ func main() {
 			return
 		}
 		writeJSON(w, map[string]int{"raceId": race.ID})
+	})
+	mux.HandleFunc("POST /api/wake", func(w http.ResponseWriter, r *http.Request) {
+		machine := r.URL.Query().Get("machine")
+		target, ok := wakeTargets[machine]
+		if !ok {
+			http.Error(w, "unknown machine", http.StatusNotFound)
+			return
+		}
+		if err := sendMagicPacket(target); err != nil {
+			log.Printf("wake %s: %v", machine, err)
+			http.Error(w, "failed to send magic packet", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("magic packet sent to %s (%s)", machine, target.mac)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /api/worker/next", func(w http.ResponseWriter, r *http.Request) {
 		info, ok := workerFromHeaders(r)

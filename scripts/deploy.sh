@@ -51,10 +51,34 @@ Nice=$4
 WantedBy=multi-user.target
 UNIT
 done
+# Pulls new GitHub releases every 5 minutes (scripts/update.sh).
+sudo tee /etc/systemd/system/render-race-update.service >/dev/null <<UNIT
+[Unit]
+Description=render-race: install the latest release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=\$(id -un)
+ExecStart=\$HOME/render-race/update.sh
+UNIT
+sudo tee /etc/systemd/system/render-race-update.timer >/dev/null <<UNIT
+[Unit]
+Description=render-race: check for a new release every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet render-race-rust render-race-go render-race-js
+sudo systemctl enable --quiet --now render-race-update.timer
 sudo systemctl restart render-race-rust render-race-go render-race-js
-systemctl is-active render-race-rust render-race-go render-race-js | paste -sd' '
+systemctl is-active render-race-rust render-race-go render-race-js render-race-update.timer | paste -sd' '
 EOF
 }
 
@@ -96,6 +120,21 @@ mini_setup() {
     # bootout is asynchronous: retry while the old instance is still tearing down.
     echo "for i in 1 2 3 4 5; do launchctl bootstrap gui/\$(id -u) $file 2>/dev/null && break; sleep 1; done"
   done
+  # Pulls new GitHub releases every 5 minutes (scripts/update.sh).
+  local file="\$HOME/Library/LaunchAgents/dev.render-race.updater.plist"
+  echo "cat > $file <<'PLIST'"
+  printf '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.render-race.updater</string>
+  <key>ProgramArguments</key><array><string>%s/render-race/update.sh</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>%s/render-race/logs/dev.render-race.updater.log</string>
+  <key>StandardErrorPath</key><string>%s/render-race/logs/dev.render-race.updater.log</string>
+</dict></plist>\n' "$MINI_HOME" "$MINI_HOME" "$MINI_HOME"
+  echo "PLIST"
+  echo "launchctl bootout gui/\$(id -u)/dev.render-race.updater 2>/dev/null || true"
+  echo "for i in 1 2 3 4 5; do launchctl bootstrap gui/\$(id -u) $file 2>/dev/null && break; sleep 1; done"
   echo 'sleep 1; launchctl list | grep render-race'
 }
 

@@ -1,0 +1,72 @@
+# Every push to main builds all platforms natively and publishes a release.
+# The machines pull it themselves (scripts/update.sh, every 5 minutes): GitHub
+# never gets access to the fleet, so no SSH key or Tailscale key lives here.
+name: release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: coordinator/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and vet
+        run: |
+          (cd coordinator && go vet ./...)
+          (cd workers/go && go vet ./...)
+          node --check workers/js/worker.mjs
+          node --check scripts/race.mjs
+      - name: Build
+        run: |
+          mkdir out
+          (cd coordinator && CGO_ENABLED=0 go build -trimpath -o ../out/coordinator .)
+          (cd workers/go && CGO_ENABLED=0 go build -trimpath -o ../../out/worker-go .)
+          (cd workers/rust && cargo build --release --locked)
+          cp workers/rust/target/release/worker-rust workers/js/worker.mjs scripts/update.sh out/
+          if [ "${{ matrix.platform }}" = linux-amd64 ]; then cp workers/cuda/worker.py out/worker-cuda.py; fi
+          echo "${{ github.sha }}" > out/COMMIT
+          tar -C out -czf render-race-${{ matrix.platform }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-race-${{ matrix.platform }}
+          path: render-race-${{ matrix.platform }}.tar.gz
+
+  release:
+    # Pull requests (including from forks) only build: they never publish.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum render-race-*.tar.gz > SHA256SUMS
+          gh release create "build-${{ github.run_number }}" render-race-*.tar.gz SHA256SUMS \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Build ${{ github.run_number }}" --notes "Commit ${{ github.sha }}" --latest

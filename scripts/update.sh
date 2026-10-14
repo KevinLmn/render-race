@@ -14,7 +14,10 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "unsupported platform $(uname -sm)" >&2; exit 1 ;;
 esac
 
-tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+# Read the whole response before searching it: piping curl into `grep -m1`
+# closes the pipe early, curl fails to write and pipefail aborts the script.
+latest=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")
+tag=$(grep -m1 '"tag_name"' <<<"$latest" | cut -d'"' -f4)
 [[ -n $tag ]] || { echo "no release found" >&2; exit 1; }
 [[ -f $DIR/RELEASE && $(cat "$DIR/RELEASE") == "$tag" ]] && exit 0
 

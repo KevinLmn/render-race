@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Render Race</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <aside class="panel">
+    <header class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>Render Race</h1>
+        <p>Rendu distribué, tuile par tuile</p>
+      </div>
+      <span id="conn" class="conn" title="Connexion au coordinateur"></span>
+    </header>
+
+    <section>
+      <h2>Workers</h2>
+      <ul id="workers" class="workers"></ul>
+      <p id="no-workers" class="hint">
+        Aucun worker connecté. Lance-en un :<br>
+        <code>cargo run --release -- --coordinator http://&lt;host&gt;:8080</code>
+      </p>
+    </section>
+
+    <section>
+      <h2>Rendu</h2>
+      <label class="field">
+        <span>Lieu</span>
+        <select id="preset"></select>
+      </label>
+      <div class="row">
+        <label class="field">
+          <span>Résolution</span>
+          <select id="resolution">
+            <option value="640x360">640 × 360</option>
+            <option value="1280x720" selected>1280 × 720</option>
+            <option value="1920x1080">1920 × 1080</option>
+            <option value="2560x1440">2560 × 1440</option>
+            <option value="3840x2160">3840 × 2160</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Tuile</span>
+          <select id="tile-size">
+            <option value="32">32 px</option>
+            <option value="64" selected>64 px</option>
+            <option value="128">128 px</option>
+            <option value="256">256 px</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">
+        <span>Itérations max <output id="iter-out"></output></span>
+        <input id="max-iter" type="range" min="6" max="17" step="0.5" value="10">
+      </label>
+      <div class="actions">
+        <button id="render" class="primary">Lancer le rendu</button>
+        <button id="reset" title="Revenir à la vue d'ensemble">Reset</button>
+      </div>
+      <label class="toggle">
+        <input id="mosaic" type="checkbox">
+        <span>Mosaïque : colorer chaque tuile par worker</span>
+      </label>
+    </section>
+
+    <section>
+      <h2>Mesures</h2>
+      <div class="progress"><span id="bar"></span></div>
+      <dl class="stats">
+        <div><dt>Tuiles</dt><dd id="s-tiles">–</dd></div>
+        <div><dt>Temps total</dt><dd id="s-elapsed">–</dd></div>
+        <div><dt>1re tuile</dt><dd id="s-first">–</dd></div>
+        <div><dt>Débit</dt><dd id="s-rate">–</dd></div>
+        <div><dt>En cours</dt><dd id="s-inflight">–</dd></div>
+        <div><dt>Redistribuées</dt><dd id="s-requeued">–</dd></div>
+      </dl>
+      <table class="per-worker">
+        <thead><tr><th>Worker</th><th>Tuiles</th><th>Part</th><th title="Temps de calcul moyen par tuile, réseau exclu">ms/tuile</th></tr></thead>
+        <tbody id="per-worker"></tbody>
+      </table>
+    </section>
+  </aside>
+
+  <main class="stage">
+    <div class="canvas-wrap">
+      <canvas id="image"></canvas>
+      <canvas id="overlay"></canvas>
+    </div>
+    <p class="stage-hint">Clic : zoom ×4 · Maj + clic : dézoom</p>
+  </main>
+</body>
+</html>

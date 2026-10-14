@@ -6,7 +6,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-COORD=${COORD:-http://100.64.0.1:8787}
+[[ -f fleet.env ]] && source fleet.env
+COORD=${COORD:-http://${COORD_IP:-localhost}:${COORD_PORT:-8080}}
 LOGS=${TMPDIR:-/tmp}/render-race
 BIN=dist/darwin-arm64
 

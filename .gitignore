@@ -2,3 +2,5 @@ target/
 dist/
 .DS_Store
 workers/go/worker-go
+fleet.env
+__pycache__/

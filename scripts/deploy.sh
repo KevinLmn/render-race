@@ -7,10 +7,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-COORD_IP=100.64.0.1 # mini, Tailscale
-# The mini wakes the PC from sleep: its Ethernet MAC and the LAN broadcast address.
-WAKE="pc=00:11:22:33:44:55@192.168.1.255"
-COORD="http://$COORD_IP:8787"
+# Fleet settings (Tailscale IP, MAC addresses) live in fleet.env, not in git.
+if [[ ! -f fleet.env ]]; then
+  echo "missing fleet.env: copy fleet.env.example and fill it in" >&2
+  exit 1
+fi
+source fleet.env
+COORD="http://$COORD_IP:$COORD_PORT"
 WSL='"C:\Program Files\WSL\wsl.exe" -d Ubuntu-24.04 --'
 
 ./scripts/build.sh
@@ -66,19 +69,19 @@ plist() {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>5</integer>
-  <key>StandardOutPath</key><string>$HOME/render-race/logs/%s.log</string>
-  <key>StandardErrorPath</key><string>$HOME/render-race/logs/%s.log</string>
-</dict></plist>\n' "$label" "$(printf '<string>%s</string>' "$@")" "$label" "$label"
+  <key>StandardOutPath</key><string>%s/render-race/logs/%s.log</string>
+  <key>StandardErrorPath</key><string>%s/render-race/logs/%s.log</string>
+</dict></plist>\n' "$label" "$(printf '<string>%s</string>' "$@")" "$MINI_HOME" "$label" "$MINI_HOME" "$label"
 }
 
 mini_setup() {
-  local R=$HOME/render-race args=(--coordinator "$COORD" --machine mini --threads 10)
+  local R=$MINI_HOME/render-race args=(--coordinator "$COORD" --machine mini --threads 10)
   echo 'set -euo pipefail; mkdir -p ~/Library/LaunchAgents'
   # Bound to the Tailscale IP only: reachable from the fleet, not from the LAN.
-  for spec in "coordinator|$R/coordinator -addr $COORD_IP:8787 -wake $WAKE" \
+  for spec in "coordinator|$R/coordinator -addr $COORD_IP:$COORD_PORT -wake $WAKE" \
     "worker-rust|$R/worker-rust ${args[*]}" \
     "worker-go|$R/worker-go ${args[*]}" \
-    "worker-js|$HOME/.local/node/bin/node $R/worker.mjs ${args[*]}"; do
+    "worker-js|$MINI_HOME/.local/node/bin/node $R/worker.mjs ${args[*]}"; do
     local name=${spec%%|*} cmd=${spec#*|}
     local label="dev.render-race.$name" file="\$HOME/Library/LaunchAgents/dev.render-race.$name.plist"
     # shellcheck disable=SC2086
@@ -93,6 +96,7 @@ mini_setup() {
 }
 
 echo "== mini"
+MINI_HOME=$(ssh mini 'echo $HOME') # launchd needs absolute paths
 ship mini darwin-arm64
 mini_setup | ssh mini bash -s
 
@@ -104,7 +108,7 @@ echo "== pc (WSL)"
 ship pc linux-amd64 "$WSL"
 linux_setup pc 32 '$HOME/.local/node/bin/node' 0 | ssh pc "$WSL bash -s"
 # GPU worker: Python + CuPy from the venv in ~/render-race/gpu-venv.
-ssh pc "$WSL bash -s" <<'EOF'
+ssh pc "$WSL env COORD=$COORD bash -s" <<'EOF'
 set -euo pipefail
 sudo tee /etc/systemd/system/render-race-cuda.service >/dev/null <<UNIT
 [Unit]
@@ -114,7 +118,7 @@ Wants=network-online.target
 
 [Service]
 User=$(id -un)
-ExecStart=$HOME/render-race/gpu-venv/bin/python $HOME/render-race/worker-cuda.py --coordinator http://100.64.0.1:8787 --machine pc --threads 16
+ExecStart=$HOME/render-race/gpu-venv/bin/python $HOME/render-race/worker-cuda.py --coordinator $COORD --machine pc --threads 16
 Restart=always
 RestartSec=3
 

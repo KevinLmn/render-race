@@ -1,5 +1,6 @@
 // Starts a race from the terminal and prints the results.
 //   node scripts/race.mjs [--coordinator URL] [--by lang|machine|worker|all]
+//   (default coordinator: $RENDER_RACE_COORDINATOR, else http://localhost:8080)
 //                         [--size 1920x1080] [--iter 4096] [--tile 64] [--preset overview]
 //                         [--lang rust]   only workers of this language
 //                         [--machine pc]  only workers of this machine
@@ -18,7 +19,7 @@ const PRESETS = {
 
 const { values: opts } = parseArgs({
   options: {
-    coordinator: { type: 'string', default: 'http://100.64.0.1:8787' },
+    coordinator: { type: 'string', default: process.env.RENDER_RACE_COORDINATOR ?? 'http://localhost:8080' },
     by: { type: 'string', default: 'lang' },
     size: { type: 'string', default: '1920x1080' },
     iter: { type: 'string', default: '4096' },

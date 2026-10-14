@@ -65,16 +65,19 @@ cd workers/rust && cargo run --release -- --coordinator http://localhost:8080 --
 
 | Machine | Rôle | Services |
 |---|---|---|
-| mini | coordinateur `100.64.0.1:8787` + workers | launchd `dev.render-race.*` |
+| mini | coordinateur (IP Tailscale, port 8787) + workers | launchd `dev.render-race.*` |
 | vps | workers, `Nice=19` pour laisser la priorité aux sites | systemd `render-race-*` |
 | pc | workers dans WSL | systemd `render-race-*`, WSL gardé allumé |
 | macbook | workers à la demande | `scripts/fleet.sh macbook start` |
+
+La config de la flotte (IP Tailscale du coordinateur, adresses MAC pour le
+Wake-on-LAN) est dans `fleet.env`, non versionné : copier `fleet.env.example`.
 
 ```
 scripts/build.sh      # cross-compile tout (Go natif, Rust via cargo-zigbuild)
 scripts/deploy.sh     # build + envoi + (re)démarrage des services
 scripts/fleet.sh status
-node scripts/race.mjs --by machine --lang rust --size 1920x1080 --iter 8192
+RENDER_RACE_COORDINATOR=http://mini:8787 node scripts/race.mjs --by machine --lang rust
 ```
 
-Interface : http://mini:8787
+Interface : `http://<coordinateur>:8787`

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"math"
 	"sort"
 	"sync"
@@ -19,6 +20,7 @@ const (
 	// A worker with no poll for this long is shown as offline.
 	onlineGrace = 30 * time.Second
 	tickEvery   = 100 * time.Millisecond
+	maxLanes    = 8
 )
 
 var (
@@ -33,15 +35,27 @@ type MandelbrotParams struct {
 	MaxIter int     `json:"maxIter"`
 }
 
-type JobSpec struct {
+// ImageSpec is the image every lane of a race renders.
+type ImageSpec struct {
 	Width    int              `json:"width"`
 	Height   int              `json:"height"`
 	TileSize int              `json:"tileSize"`
 	Params   MandelbrotParams `json:"params"`
-	Workers  []string         `json:"workers"` // allowed worker ids, empty = all
 }
 
-func (s JobSpec) validate() error {
+type LaneSpec struct {
+	Label   string   `json:"label"`
+	Workers []string `json:"workers"`
+}
+
+// RaceSpec renders the same image once per lane, each lane with its own workers.
+// A single lane with every worker is a plain distributed render.
+type RaceSpec struct {
+	ImageSpec
+	Lanes []LaneSpec `json:"lanes"`
+}
+
+func (s RaceSpec) validate() error {
 	switch {
 	case s.Width < 64 || s.Width > 3840 || s.Height < 64 || s.Height > 2160:
 		return errors.New("resolution must be between 64x64 and 3840x2160")
@@ -51,6 +65,13 @@ func (s JobSpec) validate() error {
 		return errors.New("maxIter must be between 1 and 1000000")
 	case !(s.Params.Scale > 0) || math.IsInf(s.Params.Scale, 0):
 		return errors.New("scale must be a positive number")
+	case len(s.Lanes) < 1 || len(s.Lanes) > maxLanes:
+		return errors.New("a race needs between 1 and 8 lanes")
+	}
+	for _, l := range s.Lanes {
+		if len(l.Workers) == 0 {
+			return errors.New("every lane needs at least one worker")
+		}
 	}
 	return nil
 }
@@ -86,25 +107,39 @@ type WorkerStats struct {
 	ComputeNs int64 `json:"computeNs"`
 }
 
-type Job struct {
-	ID    int     `json:"id"`
-	Spec  JobSpec `json:"spec"`
-	Cols  int     `json:"cols"`
-	Rows  int     `json:"rows"`
-	Total int     `json:"total"`
+type Race struct {
+	ID    int       `json:"id"`
+	Spec  ImageSpec `json:"spec"`
+	Cols  int       `json:"cols"`
+	Rows  int       `json:"rows"`
+	Total int       `json:"total"`
+	Lanes []*Job    `json:"lanes"`
 
-	pending   []int
-	inflight  map[int]assignment
-	results   [][]byte
-	resultBy  []int
-	doneCount int
-	requeued  int
+	// FNV-1a of the first result received for each tile, any lane. Every other
+	// lane must produce the same bytes: that's how languages are cross-checked.
+	reference []uint64
 	started   time.Time
-	firstTile time.Duration
-	finished  time.Duration
-	stats     map[string]*WorkerStats
-	allowed   map[string]bool
-	dirty     bool
+}
+
+// Job is one lane of a race.
+type Job struct {
+	ID      int      `json:"jobId"`
+	Label   string   `json:"label"`
+	Workers []string `json:"workers"`
+
+	race       *Race
+	pending    []int
+	inflight   map[int]assignment
+	results    [][]byte
+	resultBy   []int
+	doneCount  int
+	requeued   int
+	mismatches int
+	firstTile  time.Duration
+	finished   time.Duration
+	stats      map[string]*WorkerStats
+	allowed    map[string]bool
+	dirty      bool
 }
 
 type assignment struct {
@@ -112,30 +147,36 @@ type assignment struct {
 	deadline time.Time
 }
 
-func (j *Job) tile(id int) Tile {
-	ts := j.Spec.TileSize
-	x, y := (id%j.Cols)*ts, (id/j.Cols)*ts
+func (r *Race) tile(jobID, id int) Tile {
+	ts := r.Spec.TileSize
+	x, y := (id%r.Cols)*ts, (id/r.Cols)*ts
 	return Tile{
-		JobID: j.ID, ID: id, Kind: "mandelbrot",
-		X: x, Y: y, W: min(ts, j.Spec.Width-x), H: min(ts, j.Spec.Height-y),
-		Width: j.Spec.Width, Height: j.Spec.Height, Params: j.Spec.Params,
+		JobID: jobID, ID: id, Kind: "mandelbrot",
+		X: x, Y: y, W: min(ts, r.Spec.Width-x), H: min(ts, r.Spec.Height-y),
+		Width: r.Spec.Width, Height: r.Spec.Height, Params: r.Spec.Params,
 	}
 }
 
-func (j *Job) done() bool { return j.doneCount == j.Total }
+func (j *Job) done() bool { return j.doneCount == j.race.Total }
 
 type Scheduler struct {
 	mu        sync.Mutex
 	hub       *Hub
-	job       *Job
-	nextJobID int
+	race      *Race
+	jobs      map[int]*Job
+	nextID    int
 	workers   map[string]*Worker
 	// Closed and replaced on every state change, to wake up long-polling workers.
 	changed chan struct{}
 }
 
 func NewScheduler(hub *Hub) *Scheduler {
-	return &Scheduler{hub: hub, workers: map[string]*Worker{}, changed: make(chan struct{})}
+	return &Scheduler{
+		hub:     hub,
+		jobs:    map[int]*Job{},
+		workers: map[string]*Worker{},
+		changed: make(chan struct{}),
+	}
 }
 
 func (s *Scheduler) notifyLocked() {
@@ -143,52 +184,65 @@ func (s *Scheduler) notifyLocked() {
 	s.changed = make(chan struct{})
 }
 
-func (s *Scheduler) StartJob(spec JobSpec) (*Job, error) {
+func (s *Scheduler) StartRace(spec RaceSpec) (*Race, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.nextJobID++
+	s.nextID++
 	ts := spec.TileSize
-	j := &Job{
-		ID: s.nextJobID, Spec: spec,
+	r := &Race{
+		ID: s.nextID, Spec: spec.ImageSpec,
 		Cols: (spec.Width + ts - 1) / ts, Rows: (spec.Height + ts - 1) / ts,
-		inflight: map[int]assignment{},
-		stats:    map[string]*WorkerStats{},
-		started:  time.Now(),
+		started: time.Now(),
 	}
-	j.Total = j.Cols * j.Rows
-	j.results = make([][]byte, j.Total)
-	j.resultBy = make([]int, j.Total)
-	for i := range j.resultBy {
-		j.resultBy[i] = -1
-	}
-	if len(spec.Workers) > 0 {
-		j.allowed = map[string]bool{}
-		for _, id := range spec.Workers {
-			j.allowed[id] = true
-		}
-	}
+	r.Total = r.Cols * r.Rows
+	r.reference = make([]uint64, r.Total)
+
 	// Center-out order: the interesting part of the image shows up first.
-	j.pending = make([]int, j.Total)
-	for i := range j.pending {
-		j.pending[i] = i
+	order := make([]int, r.Total)
+	for i := range order {
+		order[i] = i
 	}
-	cx, cy := float64(j.Cols-1)/2, float64(j.Rows-1)/2
+	cx, cy := float64(r.Cols-1)/2, float64(r.Rows-1)/2
 	dist := func(id int) float64 {
-		dx, dy := float64(id%j.Cols)-cx, float64(id/j.Cols)-cy
+		dx, dy := float64(id%r.Cols)-cx, float64(id/r.Cols)-cy
 		return dx*dx + dy*dy
 	}
-	sort.SliceStable(j.pending, func(a, b int) bool { return dist(j.pending[a]) < dist(j.pending[b]) })
+	sort.SliceStable(order, func(a, b int) bool { return dist(order[a]) < dist(order[b]) })
 
-	// Results still in flight for the previous job are rejected as stale.
-	s.job = j
+	// Tiles still in flight for the previous race are rejected as stale.
+	s.jobs = map[int]*Job{}
+	for _, lane := range spec.Lanes {
+		s.nextID++
+		j := &Job{
+			ID: s.nextID, Label: lane.Label, Workers: lane.Workers,
+			race:     r,
+			pending:  append([]int(nil), order...),
+			inflight: map[int]assignment{},
+			results:  make([][]byte, r.Total),
+			resultBy: make([]int, r.Total),
+			stats:    map[string]*WorkerStats{},
+			allowed:  map[string]bool{},
+		}
+		for i := range j.resultBy {
+			j.resultBy[i] = -1
+		}
+		for _, id := range lane.Workers {
+			j.allowed[id] = true
+		}
+		r.Lanes = append(r.Lanes, j)
+		s.jobs[j.ID] = j
+	}
+	s.race = r
 	s.notifyLocked()
-	s.hub.Broadcast(jsonMessage(map[string]any{"type": "job", "job": j}))
-	s.broadcastProgressLocked()
-	return j, nil
+	s.hub.Broadcast(jsonMessage(map[string]any{"type": "race", "race": r}))
+	for _, j := range r.Lanes {
+		s.broadcastProgressLocked(j)
+	}
+	return r, nil
 }
 
 // Next blocks until a tile is available for this worker, or the poll times out.
@@ -227,28 +281,34 @@ func (s *Scheduler) Next(done <-chan struct{}, info Worker) (Tile, bool) {
 }
 
 func (s *Scheduler) assignLocked(workerID string) (Tile, bool) {
-	j := s.job
-	if j == nil || len(j.pending) == 0 || (j.allowed != nil && !j.allowed[workerID]) {
+	if s.race == nil {
 		return Tile{}, false
 	}
-	id := j.pending[0]
-	j.pending = j.pending[1:]
-	j.inflight[id] = assignment{worker: workerID, deadline: time.Now().Add(tileTimeout)}
-	return j.tile(id), true
+	for _, j := range s.race.Lanes {
+		if len(j.pending) == 0 || !j.allowed[workerID] {
+			continue
+		}
+		id := j.pending[0]
+		j.pending = j.pending[1:]
+		j.inflight[id] = assignment{worker: workerID, deadline: time.Now().Add(tileTimeout)}
+		return s.race.tile(j.ID, id), true
+	}
+	return Tile{}, false
 }
 
 func (s *Scheduler) Result(jobID, tileID int, workerID string, computeNs int64, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	j := s.job
-	if j == nil || j.ID != jobID {
+	j, ok := s.jobs[jobID]
+	if !ok {
 		return errStaleJob
 	}
-	if tileID < 0 || tileID >= j.Total {
+	r := j.race
+	if tileID < 0 || tileID >= r.Total {
 		return errBadTile
 	}
-	t := j.tile(tileID)
+	t := r.tile(jobID, tileID)
 	if len(data) != t.W*t.H*4 {
 		return errBadTile
 	}
@@ -267,6 +327,15 @@ func (s *Scheduler) Result(jobID, tileID int, workerID string, computeNs int64, 
 			break
 		}
 	}
+	h := fnv.New64a()
+	h.Write(data)
+	sum := h.Sum64() | 1 // never 0, which marks "no reference yet"
+	if ref := r.reference[tileID]; ref == 0 {
+		r.reference[tileID] = sum
+	} else if ref != sum {
+		j.mismatches++
+	}
+
 	j.results[tileID] = data
 	j.resultBy[tileID] = w.Index
 	j.doneCount++
@@ -279,13 +348,13 @@ func (s *Scheduler) Result(jobID, tileID int, workerID string, computeNs int64, 
 	st.Pixels += t.W * t.H
 	st.ComputeNs += computeNs
 	if j.doneCount == 1 {
-		j.firstTile = time.Since(j.started)
+		j.firstTile = time.Since(r.started)
 	}
 	j.dirty = true
 	s.hub.Broadcast(tileFrame(j.ID, tileID, w.Index, data))
 	if j.done() {
-		j.finished = time.Since(j.started)
-		s.broadcastProgressLocked()
+		j.finished = time.Since(r.started)
+		s.broadcastProgressLocked(j)
 	}
 	return nil
 }
@@ -297,8 +366,8 @@ func (s *Scheduler) Run() {
 	for range ticker.C {
 		s.mu.Lock()
 		now := time.Now()
-		if j := s.job; j != nil {
-			expired := false
+		expired := false
+		for _, j := range s.jobs {
 			for id, a := range j.inflight {
 				if now.After(a.deadline) {
 					delete(j.inflight, id)
@@ -308,12 +377,12 @@ func (s *Scheduler) Run() {
 					expired = true
 				}
 			}
-			if expired {
-				s.notifyLocked()
-			}
 			if j.dirty {
-				s.broadcastProgressLocked()
+				s.broadcastProgressLocked(j)
 			}
+		}
+		if expired {
+			s.notifyLocked()
 		}
 		presenceChanged := false
 		for _, w := range s.workers {
@@ -324,7 +393,7 @@ func (s *Scheduler) Run() {
 			}
 		}
 		if presenceChanged {
-			s.broadcastWorkersLocked()
+			s.hub.Broadcast(s.workersMessageLocked())
 		}
 		s.mu.Unlock()
 	}
@@ -341,13 +410,9 @@ func (s *Scheduler) touchLocked(info Worker) *Worker {
 	w.lastSeen = time.Now()
 	if !w.Online {
 		w.Online = true
-		s.broadcastWorkersLocked()
+		s.hub.Broadcast(s.workersMessageLocked())
 	}
 	return w
-}
-
-func (s *Scheduler) broadcastWorkersLocked() {
-	s.hub.Broadcast(s.workersMessageLocked())
 }
 
 func (s *Scheduler) workersMessageLocked() message {
@@ -359,16 +424,15 @@ func (s *Scheduler) workersMessageLocked() message {
 	return jsonMessage(map[string]any{"type": "workers", "workers": list})
 }
 
-func (s *Scheduler) broadcastProgressLocked() {
-	s.job.dirty = false
-	s.hub.Broadcast(s.progressMessageLocked())
+func (s *Scheduler) broadcastProgressLocked(j *Job) {
+	j.dirty = false
+	s.hub.Broadcast(s.progressMessageLocked(j))
 }
 
-func (s *Scheduler) progressMessageLocked() message {
-	j := s.job
+func (s *Scheduler) progressMessageLocked(j *Job) message {
 	elapsed := j.finished
 	if !j.done() {
-		elapsed = time.Since(j.started)
+		elapsed = time.Since(j.race.started)
 	}
 	stats := make(map[string]WorkerStats, len(j.stats))
 	for id, st := range j.stats {
@@ -378,9 +442,10 @@ func (s *Scheduler) progressMessageLocked() message {
 		"type":        "progress",
 		"jobId":       j.ID,
 		"done":        j.doneCount,
-		"total":       j.Total,
+		"total":       j.race.Total,
 		"inflight":    len(j.inflight),
 		"requeued":    j.requeued,
+		"mismatches":  j.mismatches,
 		"elapsedMs":   ms(elapsed),
 		"firstTileMs": ms(j.firstTile),
 		"finished":    j.done(),
@@ -394,14 +459,16 @@ func (s *Scheduler) Connect(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	initial := []message{s.workersMessageLocked()}
-	if j := s.job; j != nil {
-		initial = append(initial, jsonMessage(map[string]any{"type": "job", "job": j}))
-		for id, data := range j.results {
-			if data != nil {
-				initial = append(initial, tileFrame(j.ID, id, j.resultBy[id], data))
+	if r := s.race; r != nil {
+		initial = append(initial, jsonMessage(map[string]any{"type": "race", "race": r}))
+		for _, j := range r.Lanes {
+			for id, data := range j.results {
+				if data != nil {
+					initial = append(initial, tileFrame(j.ID, id, j.resultBy[id], data))
+				}
 			}
+			initial = append(initial, s.progressMessageLocked(j))
 		}
-		initial = append(initial, s.progressMessageLocked())
 	}
 	s.hub.Add(c, initial)
 }

@@ -39,24 +39,24 @@ func main() {
 		if err != nil {
 			return
 		}
-		c := &client{conn: conn, send: make(chan message, clientBuffer)}
+		c := &client{conn: conn}
 		ctx := conn.CloseRead(r.Context()) // cancelled when the browser goes away
 		sched.Connect(c)
 		c.writeLoop(ctx)
 		hub.Remove(c)
 	})
-	mux.HandleFunc("POST /api/jobs", func(w http.ResponseWriter, r *http.Request) {
-		var spec JobSpec
+	mux.HandleFunc("POST /api/races", func(w http.ResponseWriter, r *http.Request) {
+		var spec RaceSpec
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&spec); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		job, err := sched.StartJob(spec)
+		race, err := sched.StartRace(spec)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, map[string]int{"jobId": job.ID})
+		writeJSON(w, map[string]int{"raceId": race.ID})
 	})
 	mux.HandleFunc("GET /api/worker/next", func(w http.ResponseWriter, r *http.Request) {
 		info, ok := workerFromHeaders(r)

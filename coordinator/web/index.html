@@ -30,6 +30,15 @@
     <section>
       <h2>Rendu</h2>
       <label class="field">
+        <span>Mode</span>
+        <select id="mode">
+          <option value="all">Distribué : tous les workers sur une image</option>
+          <option value="machine">Course par machine</option>
+          <option value="lang" selected>Course par langage</option>
+          <option value="worker">Course par worker</option>
+        </select>
+      </label>
+      <label class="field">
         <span>Lieu</span>
         <select id="preset"></select>
       </label>
@@ -59,7 +68,7 @@
         <input id="max-iter" type="range" min="6" max="17" step="0.5" value="10">
       </label>
       <div class="actions">
-        <button id="render" class="primary">Lancer le rendu</button>
+        <button id="render" class="primary">Lancer</button>
         <button id="reset" title="Revenir à la vue d'ensemble">Reset</button>
       </div>
       <label class="toggle">
@@ -69,28 +78,22 @@
     </section>
 
     <section>
-      <h2>Mesures</h2>
-      <div class="progress"><span id="bar"></span></div>
-      <dl class="stats">
-        <div><dt>Tuiles</dt><dd id="s-tiles">–</dd></div>
-        <div><dt>Temps total</dt><dd id="s-elapsed">–</dd></div>
-        <div><dt>1re tuile</dt><dd id="s-first">–</dd></div>
-        <div><dt>Débit</dt><dd id="s-rate">–</dd></div>
-        <div><dt>En cours</dt><dd id="s-inflight">–</dd></div>
-        <div><dt>Redistribuées</dt><dd id="s-requeued">–</dd></div>
-      </dl>
+      <h2>Classement</h2>
+      <ol id="ranking" class="ranking"></ol>
+      <p class="hint" id="ranking-hint">Lance une course pour voir le classement.</p>
+    </section>
+
+    <section>
+      <h2>Par worker</h2>
       <table class="per-worker">
-        <thead><tr><th>Worker</th><th>Tuiles</th><th>Part</th><th title="Temps de calcul moyen par tuile, réseau exclu">ms/tuile</th></tr></thead>
+        <thead><tr><th>Worker</th><th>Tuiles</th><th title="Temps de calcul moyen par tuile, réseau exclu">ms/tuile</th><th title="Pixels calculés par seconde et par thread, réseau exclu">Mpx/s/thr</th></tr></thead>
         <tbody id="per-worker"></tbody>
       </table>
     </section>
   </aside>
 
   <main class="stage">
-    <div class="canvas-wrap">
-      <canvas id="image"></canvas>
-      <canvas id="overlay"></canvas>
-    </div>
+    <div id="lanes" class="lanes"></div>
     <p class="stage-hint">Clic : zoom ×4 · Maj + clic : dézoom</p>
   </main>
 </body>

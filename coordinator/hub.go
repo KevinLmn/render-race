@@ -8,8 +8,8 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Large enough to replay a full 4K job in 32px tiles to a browser that just connected.
-const clientBuffer = 10_000
+// Headroom on top of the replay, for live messages while the browser catches up.
+const clientBuffer = 4096
 
 type message struct {
 	data   []byte
@@ -32,9 +32,11 @@ func NewHub() *Hub {
 	return &Hub{clients: map[*client]struct{}{}}
 }
 
+// Add sizes the client's queue to hold the whole replay, so it never blocks.
 func (h *Hub) Add(c *client, initial []message) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	c.send = make(chan message, len(initial)+clientBuffer)
 	for _, m := range initial {
 		c.send <- m
 	}

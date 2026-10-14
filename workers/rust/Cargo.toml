@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# Correctly rounded float parsing: the default fast path can be 1 ULP off, which
+# shifts pixels at deep zoom and makes Rust disagree with the Go and JS workers.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ureq = { version = "2.12", features = ["json"] }
 
 [profile.release]

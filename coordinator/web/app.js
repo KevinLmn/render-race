@@ -1,4 +1,4 @@
-// Browser side: sends render jobs, draws tiles as they stream in, shows who computed what.
+// Browser side: starts races, draws every lane as tiles stream in, ranks the lanes.
 
 const $ = (id) => document.getElementById(id)
 
@@ -18,19 +18,11 @@ const state = {
   workers: [], // indexed by worker.index
   selected: new Set(),
   knownWorkers: new Set(),
-  job: null,
+  race: null,
+  lanes: new Map(), // jobId -> lane
   view: { ...PRESETS[0] },
-  image: null, // ImageData for the current job
-  pixels: null, // Uint32Array view of image.data
   lut: null,
-  tileOwner: null, // worker index per tile, -1 if not done
-  flashes: [],
 }
-
-const imageCanvas = $('image')
-const imageCtx = imageCanvas.getContext('2d')
-const overlay = $('overlay')
-const overlayCtx = overlay.getContext('2d')
 
 // --- controls ------------------------------------------------------------------
 
@@ -40,10 +32,10 @@ $('preset').addEventListener('change', () => {
   state.view = { ...p }
   $('max-iter').value = p.iterExp
   updateIterLabel()
-  render()
+  start()
 })
 $('max-iter').addEventListener('input', updateIterLabel)
-$('render').addEventListener('click', render)
+$('render').addEventListener('click', start)
 $('reset').addEventListener('click', () => {
   $('preset').value = 0
   $('preset').dispatchEvent(new Event('change'))
@@ -57,53 +49,60 @@ function updateIterLabel() {
 }
 updateIterLabel()
 
-imageCanvas.addEventListener('click', (e) => {
-  const job = state.job
-  if (!job) return
-  const rect = imageCanvas.getBoundingClientRect()
-  const px = ((e.clientX - rect.left) / rect.width) * job.spec.width
-  const py = ((e.clientY - rect.top) / rect.height) * job.spec.height
-  const { centerX, centerY, scale } = job.spec.params
-  state.view.centerX = centerX + (px - job.spec.width / 2) * scale
-  state.view.centerY = centerY + (py - job.spec.height / 2) * scale
-  state.view.span = scale * job.spec.width * (e.shiftKey ? 4 : 0.25)
-  render()
-})
+function zoomAt(e, canvas) {
+  const race = state.race
+  if (!race) return
+  const rect = canvas.getBoundingClientRect()
+  const px = ((e.clientX - rect.left) / rect.width) * race.spec.width
+  const py = ((e.clientY - rect.top) / rect.height) * race.spec.height
+  const { centerX, centerY, scale } = race.spec.params
+  state.view.centerX = centerX + (px - race.spec.width / 2) * scale
+  state.view.centerY = centerY + (py - race.spec.height / 2) * scale
+  state.view.span = scale * race.spec.width * (e.shiftKey ? 4 : 0.25)
+  start()
+}
 
-async function render() {
+function buildLanes() {
+  const workers = state.workers.filter((w) => w?.online && state.selected.has(w.id))
+  const key = {
+    all: () => 'Toutes les machines',
+    machine: (w) => w.machine,
+    lang: (w) => w.lang,
+    worker: (w) => `${w.machine} · ${w.lang}`,
+  }[$('mode').value]
+  return [...Map.groupBy(workers, key)].map(([label, ws]) => ({ label, workers: ws.map((w) => w.id) }))
+}
+
+async function start() {
   const [width, height] = $('resolution').value.split('x').map(Number)
-  const online = state.workers.filter((w) => w.online && state.selected.has(w.id))
-  if (online.length === 0) {
-    flashButton('Aucun worker sélectionné')
-    return
-  }
-  const spec = {
-    width,
-    height,
-    tileSize: Number($('tile-size').value),
-    params: {
-      centerX: state.view.centerX,
-      centerY: state.view.centerY,
-      scale: state.view.span / width,
-      maxIter: maxIter(),
-    },
-    workers: online.map((w) => w.id),
-  }
-  const res = await fetch('/api/jobs', {
+  const lanes = buildLanes()
+  if (lanes.length === 0) return flashButton('Aucun worker sélectionné')
+  if (lanes.length > 8) return flashButton('8 couloirs maximum')
+  const res = await fetch('/api/races', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(spec),
+    body: JSON.stringify({
+      width,
+      height,
+      tileSize: Number($('tile-size').value),
+      params: {
+        centerX: state.view.centerX,
+        centerY: state.view.centerY,
+        scale: state.view.span / width,
+        maxIter: maxIter(),
+      },
+      lanes,
+    }),
   })
   if (!res.ok) flashButton(await res.text())
 }
 
 function flashButton(text) {
   const btn = $('render')
-  const original = 'Lancer le rendu'
   btn.textContent = text
   btn.disabled = true
   setTimeout(() => {
-    btn.textContent = original
+    btn.textContent = 'Lancer'
     btn.disabled = false
   }, 1600)
 }
@@ -122,7 +121,7 @@ function connect() {
     if (typeof e.data !== 'string') return onTile(e.data)
     const msg = JSON.parse(e.data)
     if (msg.type === 'workers') onWorkers(msg.workers)
-    else if (msg.type === 'job') onJob(msg.job)
+    else if (msg.type === 'race') onRace(msg.race)
     else if (msg.type === 'progress') onProgress(msg)
   }
 }
@@ -137,8 +136,7 @@ function onWorkers(workers) {
       state.selected.add(w.id)
     }
   }
-  const list = $('workers')
-  list.replaceChildren(
+  $('workers').replaceChildren(
     ...workers.map((w) => {
       const li = document.createElement('li')
       li.className = w.online ? '' : 'offline'
@@ -159,75 +157,151 @@ function onWorkers(workers) {
   $('no-workers').hidden = workers.some((w) => w.online)
 }
 
-function onJob(job) {
-  state.job = job
-  const { width, height, params } = job.spec
-  for (const c of [imageCanvas, overlay]) {
-    c.width = width
-    c.height = height
-  }
-  state.image = imageCtx.createImageData(width, height)
-  state.pixels = new Uint32Array(state.image.data.buffer)
-  state.pixels.fill(0xff000000)
-  imageCtx.putImageData(state.image, 0, 0)
+function onRace(race) {
+  state.race = race
+  const { width, height, params } = race.spec
   state.lut = buildLut(params.maxIter)
-  state.tileOwner = new Int16Array(job.total).fill(-1)
-  state.flashes = []
   state.view.centerX = params.centerX
   state.view.centerY = params.centerY
   state.view.span = params.scale * width
+
+  const container = $('lanes')
+  const cols = race.lanes.length === 1 ? 1 : race.lanes.length <= 4 ? 2 : race.lanes.length <= 6 ? 3 : 4
+  container.style.setProperty('--cols', cols)
+  container.style.setProperty('--rows', Math.ceil(race.lanes.length / cols))
+  state.lanes.clear()
+  container.replaceChildren(
+    ...race.lanes.map((job) => {
+      const el = document.createElement('article')
+      el.className = 'lane'
+      el.innerHTML = `<header><span class="rank"></span><span class="lane-label"></span><span class="lane-time">–</span></header>
+        <div class="lane-canvas"><canvas class="image"></canvas><canvas class="overlay"></canvas></div>
+        <footer><div class="lane-bar"><span></span></div><span class="lane-stats">0 / ${race.total}</span></footer>`
+      el.querySelector('.lane-label').textContent = job.label
+      const image = el.querySelector('.image')
+      const overlay = el.querySelector('.overlay')
+      for (const c of [image, overlay]) {
+        c.width = width
+        c.height = height
+      }
+      image.addEventListener('click', (e) => zoomAt(e, image))
+      const ctx = image.getContext('2d')
+      const imageData = ctx.createImageData(width, height)
+      const pixels = new Uint32Array(imageData.data.buffer)
+      pixels.fill(0xff000000)
+      ctx.putImageData(imageData, 0, 0)
+      const lane = {
+        job,
+        el,
+        ctx,
+        imageData,
+        pixels,
+        octx: overlay.getContext('2d'),
+        overlay,
+        tileOwner: new Int16Array(race.total).fill(-1),
+        flashes: [],
+        progress: null,
+      }
+      state.lanes.set(job.jobId, lane)
+      return el
+    }),
+  )
+  renderRanking()
 }
 
 function onTile(buffer) {
-  const job = state.job
+  const race = state.race
   const head = new DataView(buffer, 0, 12)
-  const jobId = head.getUint32(0, true)
-  if (!job || jobId !== job.id) return
+  const lane = state.lanes.get(head.getUint32(0, true))
+  if (!race || !lane) return
   const tileId = head.getUint32(4, true)
   const workerIndex = head.getUint16(8, true)
   const counts = new Uint32Array(buffer, 12)
 
-  const ts = job.spec.tileSize
-  const x = (tileId % job.cols) * ts
-  const y = Math.floor(tileId / job.cols) * ts
-  const w = Math.min(ts, job.spec.width - x)
-  const h = Math.min(ts, job.spec.height - y)
-  const { pixels, lut } = state
-  const stride = job.spec.width
+  const ts = race.spec.tileSize
+  const x = (tileId % race.cols) * ts
+  const y = Math.floor(tileId / race.cols) * ts
+  const w = Math.min(ts, race.spec.width - x)
+  const h = Math.min(ts, race.spec.height - y)
+  const { pixels } = lane
+  const lut = state.lut
+  const stride = race.spec.width
   for (let row = 0; row < h; row++) {
     const src = row * w
     const dst = (y + row) * stride + x
     for (let col = 0; col < w; col++) pixels[dst + col] = lut[counts[src + col]]
   }
-  imageCtx.putImageData(state.image, 0, 0, x, y, w, h)
-  state.tileOwner[tileId] = workerIndex
-  state.flashes.push({ x, y, w, h, workerIndex, at: performance.now() })
+  lane.ctx.putImageData(lane.imageData, 0, 0, x, y, w, h)
+  lane.tileOwner[tileId] = workerIndex
+  lane.flashes.push({ x, y, w, h, workerIndex, at: performance.now() })
 }
 
 function onProgress(p) {
-  if (!state.job || p.jobId !== state.job.id) return
-  const pct = p.total ? (p.done / p.total) * 100 : 0
-  $('bar').style.width = `${pct}%`
-  $('s-tiles').textContent = `${p.done} / ${p.total}`
-  $('s-elapsed').textContent = formatMs(p.elapsedMs)
-  $('s-first').textContent = p.firstTileMs ? formatMs(p.firstTileMs) : '–'
-  const pixelsDone = Object.values(p.stats).reduce((sum, s) => sum + s.pixels, 0)
-  $('s-rate').textContent = p.elapsedMs ? `${(pixelsDone / p.elapsedMs / 1000).toFixed(1)} Mpx/s` : '–'
-  $('s-inflight').textContent = p.inflight
-  $('s-requeued').textContent = p.requeued
+  const lane = state.lanes.get(p.jobId)
+  if (!lane) return
+  lane.progress = p
+  lane.el.querySelector('.lane-bar span').style.width = `${(p.done / p.total) * 100}%`
+  lane.el.querySelector('.lane-time').textContent = formatMs(p.elapsedMs)
+  const parts = [`${p.done} / ${p.total}`, `${mpxPerSec(p)} Mpx/s`]
+  if (p.requeued) parts.push(`${p.requeued} redistribuées`)
+  if (p.mismatches) parts.push(`⚠ ${p.mismatches} tuiles différentes`)
+  lane.el.querySelector('.lane-stats').textContent = parts.join(' · ')
+  lane.el.classList.toggle('finished', p.finished)
+  lane.el.classList.toggle('mismatch', p.mismatches > 0)
+  renderRanking()
+  renderPerWorker()
+}
 
-  const rows = Object.entries(p.stats)
-    .map(([id, s]) => ({ id, ...s, worker: state.workers.find((w) => w?.id === id) }))
-    .sort((a, b) => b.tiles - a.tiles)
+// Finished lanes by time, then running lanes by progress.
+function renderRanking() {
+  const lanes = [...state.lanes.values()]
+  const ranked = lanes.sort((a, b) => {
+    const pa = a.progress
+    const pb = b.progress
+    if (pa?.finished && pb?.finished) return pa.elapsedMs - pb.elapsedMs
+    if (pa?.finished !== pb?.finished) return pa?.finished ? -1 : 1
+    return (pb?.done ?? 0) - (pa?.done ?? 0)
+  })
+  const winner = ranked[0]?.progress?.elapsedMs
+  $('ranking').replaceChildren(
+    ...ranked.map((lane, i) => {
+      const p = lane.progress
+      const li = document.createElement('li')
+      li.className = p?.finished ? 'finished' : ''
+      const gap = p?.finished && i > 0 ? ` <small>×${(p.elapsedMs / winner).toFixed(2)}</small>` : ''
+      const time = p?.finished ? formatMs(p.elapsedMs) : `${Math.round(((p?.done ?? 0) / (p?.total || 1)) * 100)} %`
+      li.innerHTML = `<span class="pos">${i + 1}</span><span class="name"></span><span class="time">${time}${gap}</span>`
+      li.querySelector('.name').textContent = lane.job.label
+      if (p?.mismatches) li.querySelector('.name').textContent += ' ⚠'
+      lane.el.querySelector('.rank').textContent = p?.finished ? `#${i + 1}` : ''
+      return li
+    }),
+  )
+  $('ranking-hint').hidden = ranked.length > 0
+}
+
+// Compute-only throughput per worker, aggregated over every lane of the race.
+function renderPerWorker() {
+  const totals = new Map()
+  for (const lane of state.lanes.values()) {
+    for (const [id, s] of Object.entries(lane.progress?.stats ?? {})) {
+      const t = totals.get(id) ?? { tiles: 0, pixels: 0, computeNs: 0 }
+      t.tiles += s.tiles
+      t.pixels += s.pixels
+      t.computeNs += s.computeNs
+      totals.set(id, t)
+    }
+  }
+  const rows = [...totals].sort((a, b) => b[1].pixels / b[1].computeNs - a[1].pixels / a[1].computeNs)
   $('per-worker').replaceChildren(
-    ...rows.map((r) => {
+    ...rows.map(([id, t]) => {
+      const worker = state.workers.find((w) => w?.id === id)
       const tr = document.createElement('tr')
-      const label = r.worker ? `${r.worker.machine} · ${r.worker.lang}` : r.id
-      tr.innerHTML = `<td><span class="swatch" style="background:${colorOf(r.worker?.index ?? 0)}"></span><span></span></td>
-        <td>${r.tiles}</td>
-        <td>${((r.tiles / Math.max(1, p.done)) * 100).toFixed(0)}%</td>
-        <td>${(r.computeNs / r.tiles / 1e6).toFixed(1)}</td>`
-      tr.querySelector('td span:last-child').textContent = label
+      tr.innerHTML = `<td><span class="swatch" style="background:${colorOf(worker?.index ?? 0)}"></span><span></span></td>
+        <td>${t.tiles}</td>
+        <td>${(t.computeNs / t.tiles / 1e6).toFixed(1)}</td>
+        <td>${((t.pixels / t.computeNs) * 1e3).toFixed(2)}</td>`
+      tr.querySelector('td span:last-child').textContent = worker ? `${worker.machine} · ${worker.lang}` : id
       return tr
     }),
   )
@@ -239,12 +313,17 @@ function colorOf(index) {
   return WORKER_COLORS[index % WORKER_COLORS.length]
 }
 
+function mpxPerSec(p) {
+  const pixels = Object.values(p.stats).reduce((sum, s) => sum + s.pixels, 0)
+  return p.elapsedMs ? (pixels / p.elapsedMs / 1000).toFixed(1) : '0'
+}
+
 // Iteration count -> packed ABGR pixel. Points that never escape are black.
 function buildLut(max) {
   const lut = new Uint32Array(max + 1)
   for (let i = 0; i < max; i++) {
     const t = Math.sqrt(i) * 0.18
-    const r = 0.5 + 0.5 * Math.cos(6.2832 * (t + 0.0))
+    const r = 0.5 + 0.5 * Math.cos(6.2832 * t)
     const g = 0.5 + 0.5 * Math.cos(6.2832 * (t + 0.15))
     const b = 0.5 + 0.5 * Math.cos(6.2832 * (t + 0.3))
     // Fade in from black near the outside so the background stays calm.
@@ -259,40 +338,49 @@ function buildLut(max) {
   return lut
 }
 
-function drawOverlay(now) {
-  requestAnimationFrame(drawOverlay)
-  const job = state.job
-  overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
-  if (!job) return
-  const ts = job.spec.tileSize
-  const lineWidth = Math.max(1, job.spec.width / 640)
+function drawOverlays(now) {
+  requestAnimationFrame(drawOverlays)
+  const race = state.race
+  if (!race) return
+  const ts = race.spec.tileSize
+  const lineWidth = Math.max(1, race.spec.width / 640)
+  const mosaic = $('mosaic').checked
 
-  if ($('mosaic').checked) {
-    overlayCtx.globalAlpha = 0.35
-    for (let id = 0; id < state.tileOwner.length; id++) {
-      const owner = state.tileOwner[id]
-      if (owner < 0) continue
-      overlayCtx.fillStyle = colorOf(owner)
-      overlayCtx.fillRect((id % job.cols) * ts, Math.floor(id / job.cols) * ts, ts, ts)
+  for (const lane of state.lanes.values()) {
+    const { octx, overlay } = lane
+    lane.flashes = lane.flashes.filter((f) => now - f.at < FLASH_MS)
+    // Nothing to animate: leave the overlay as it is.
+    if (!mosaic && lane.flashes.length === 0 && !lane.dirtyOverlay) continue
+    octx.clearRect(0, 0, overlay.width, overlay.height)
+    lane.dirtyOverlay = lane.flashes.length > 0
+
+    if (mosaic) {
+      octx.globalAlpha = 0.35
+      for (let id = 0; id < lane.tileOwner.length; id++) {
+        const owner = lane.tileOwner[id]
+        if (owner < 0) continue
+        octx.fillStyle = colorOf(owner)
+        octx.fillRect((id % race.cols) * ts, Math.floor(id / race.cols) * ts, ts, ts)
+      }
+      octx.globalAlpha = 1
+      lane.dirtyOverlay = true
+      continue
     }
-    overlayCtx.globalAlpha = 1
-    return
-  }
 
-  state.flashes = state.flashes.filter((f) => now - f.at < FLASH_MS)
-  overlayCtx.lineWidth = lineWidth
-  for (const f of state.flashes) {
-    const life = 1 - (now - f.at) / FLASH_MS
-    overlayCtx.globalAlpha = life * 0.9
-    overlayCtx.strokeStyle = colorOf(f.workerIndex)
-    overlayCtx.strokeRect(f.x + lineWidth / 2, f.y + lineWidth / 2, f.w - lineWidth, f.h - lineWidth)
-    overlayCtx.globalAlpha = life * 0.22
-    overlayCtx.fillStyle = colorOf(f.workerIndex)
-    overlayCtx.fillRect(f.x, f.y, f.w, f.h)
+    octx.lineWidth = lineWidth
+    for (const f of lane.flashes) {
+      const life = 1 - (now - f.at) / FLASH_MS
+      octx.globalAlpha = life * 0.9
+      octx.strokeStyle = colorOf(f.workerIndex)
+      octx.strokeRect(f.x + lineWidth / 2, f.y + lineWidth / 2, f.w - lineWidth, f.h - lineWidth)
+      octx.globalAlpha = life * 0.22
+      octx.fillStyle = colorOf(f.workerIndex)
+      octx.fillRect(f.x, f.y, f.w, f.h)
+    }
+    octx.globalAlpha = 1
   }
-  overlayCtx.globalAlpha = 1
 }
-requestAnimationFrame(drawOverlay)
+requestAnimationFrame(drawOverlays)
 
 function formatMs(ms) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`

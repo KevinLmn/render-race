@@ -1,2 +1,4 @@
 target/
+dist/
 .DS_Store
+workers/go/worker-go

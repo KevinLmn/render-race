@@ -17,8 +17,9 @@ type message struct {
 }
 
 type client struct {
-	conn *websocket.Conn
-	send chan message
+	conn  *websocket.Conn
+	send  chan message
+	admin bool // connected through the private listener
 }
 
 // Hub fans messages out to browsers. Broadcast never blocks: a browser that
@@ -41,6 +42,12 @@ func (h *Hub) Add(c *client, initial []message) {
 		c.send <- m
 	}
 	h.clients[c] = struct{}{}
+}
+
+func (h *Hub) Count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.clients)
 }
 
 func (h *Hub) Remove(c *client) {

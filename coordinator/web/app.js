@@ -20,6 +20,8 @@ const state = {
   knownWorkers: new Set(),
   race: null,
   lanes: new Map(), // jobId -> lane
+  wakeable: [], // machines we can wake; only sent to the private (admin) listener
+  admin: false,
   view: { ...PRESETS[0] },
   lut: null,
 }
@@ -125,7 +127,7 @@ function flashButton(text) {
   setTimeout(() => {
     btn.textContent = 'Lancer'
     btn.disabled = false
-  }, 1600)
+  }, 2600)
 }
 
 // --- coordinator connection ------------------------------------------------------
@@ -141,14 +143,38 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') return onTile(e.data)
     const msg = JSON.parse(e.data)
-    if (msg.type === 'workers') onWorkers(msg.workers, msg.wakeable ?? [])
+    if (msg.type === 'workers') onWorkers(msg.workers)
+    else if (msg.type === 'wakeable') onAdmin(msg.machines)
     else if (msg.type === 'race') onRace(msg.race)
     else if (msg.type === 'progress') onProgress(msg)
   }
 }
 connect()
 
-function onWorkers(workers, wakeable) {
+// Only the private listener sends this: unlock the settings above the public limits.
+function onAdmin(machines) {
+  state.admin = true
+  state.wakeable = machines
+  applyLimits()
+  onWorkers(state.workers.filter(Boolean))
+}
+
+const PUBLIC_LIMITS = { pixels: 1920 * 1080, iterExp: 16, sppExp: 6 }
+function applyLimits() {
+  for (const opt of $('resolution').options) {
+    const [w, h] = opt.value.split('x').map(Number)
+    opt.disabled = !state.admin && w * h > PUBLIC_LIMITS.pixels
+  }
+  for (const opt of $('tile-size').options) opt.disabled = !state.admin && Number(opt.value) < 64
+  $('max-iter').max = state.admin ? 17 : PUBLIC_LIMITS.iterExp
+  $('spp').max = state.admin ? 9 : PUBLIC_LIMITS.sppExp
+  updateIterLabel()
+  updateSppLabel()
+}
+applyLimits()
+
+function onWorkers(workers) {
+  const wakeable = state.wakeable
   state.workers = []
   for (const w of workers) {
     state.workers[w.index] = w

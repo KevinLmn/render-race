@@ -458,7 +458,7 @@ func (s *Scheduler) workersMessageLocked() message {
 		list = append(list, w)
 	}
 	sort.Slice(list, func(a, b int) bool { return list[a].Index < list[b].Index })
-	return jsonMessage(map[string]any{"type": "workers", "workers": list, "wakeable": s.wakeable})
+	return jsonMessage(map[string]any{"type": "workers", "workers": list})
 }
 
 func (s *Scheduler) broadcastProgressLocked(j *Job) {
@@ -496,6 +496,10 @@ func (s *Scheduler) Connect(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	initial := []message{s.workersMessageLocked()}
+	if c.admin {
+		// Only the private listener can wake machines, so only it learns which.
+		initial = append(initial, jsonMessage(map[string]any{"type": "wakeable", "machines": s.wakeable}))
+	}
 	if r := s.race; r != nil {
 		initial = append(initial, jsonMessage(map[string]any{"type": "race", "race": r}))
 		for _, j := range r.Lanes {
@@ -508,6 +512,22 @@ func (s *Scheduler) Connect(c *client) {
 		}
 	}
 	s.hub.Add(c, initial)
+}
+
+// RaceRunningFor is how long the current race has been running, or an
+// effectively infinite duration when no race is running.
+func (s *Scheduler) RaceRunningFor() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.race == nil {
+		return math.MaxInt64
+	}
+	for _, j := range s.race.Lanes {
+		if !j.done() {
+			return time.Since(s.race.started)
+		}
+	}
+	return math.MaxInt64
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }

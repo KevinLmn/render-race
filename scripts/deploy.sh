@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Ships dist/ to the fleet and (re)starts everything as services:
-#   mini  coordinator + rust/go/js workers (launchd)
-#   vps   rust/go/js workers, niced so the websites keep priority (systemd)
+#   vps   coordinator (private listener on Tailscale, public one behind Caddy)
+#         + rust/go/js workers, niced so the websites keep priority (systemd)
+#   mini  Wake-on-LAN relay + rust/go/js workers (launchd)
 #   pc    rust/go/js workers + the CUDA worker inside WSL (systemd)
 # The MacBook runs its workers on demand: scripts/fleet.sh macbook start
 set -euo pipefail
@@ -77,8 +78,11 @@ plist() {
 mini_setup() {
   local R=$MINI_HOME/render-race args=(--coordinator "$COORD" --machine mini --threads 10)
   echo 'set -euo pipefail; mkdir -p ~/Library/LaunchAgents'
-  # Bound to the Tailscale IP only: reachable from the fleet, not from the LAN.
-  for spec in "coordinator|$R/coordinator -addr $COORD_IP:$COORD_PORT -wake $WAKE" \
+  # The coordinator used to run here: remove its agent.
+  echo "launchctl bootout gui/\$(id -u)/dev.render-race.coordinator 2>/dev/null || true"
+  echo "rm -f \$HOME/Library/LaunchAgents/dev.render-race.coordinator.plist"
+  # The relay is bound to the Tailscale IP only: the coordinator calls it, the LAN can't.
+  for spec in "wake-relay|$R/coordinator -relay -addr $RELAY_IP:$RELAY_PORT -wake $WAKE" \
     "worker-rust|$R/worker-rust ${args[*]}" \
     "worker-go|$R/worker-go ${args[*]}" \
     "worker-js|$MINI_HOME/.local/node/bin/node $R/worker.mjs ${args[*]}"; do
@@ -95,14 +99,38 @@ mini_setup() {
   echo 'sleep 1; launchctl list | grep render-race'
 }
 
+echo "== vps"
+ship vps linux-arm64
+ssh vps bash -s <<EOF
+set -euo pipefail
+sudo tee /etc/systemd/system/render-race-coordinator.service >/dev/null <<UNIT
+[Unit]
+Description=render-race coordinator
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=\$(id -un)
+ExecStart=\$HOME/render-race/coordinator -addr $COORD_IP:$COORD_PORT -public-addr 127.0.0.1:$PUBLIC_PORT -wake-relay http://$RELAY_IP:$RELAY_PORT -wakeable $WAKEABLE
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# Workers reach the private listener over Tailscale only; the public one is loopback.
+sudo ufw allow in on tailscale0 to any port $COORD_PORT proto tcp >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet render-race-coordinator
+sudo systemctl restart render-race-coordinator
+systemctl is-active render-race-coordinator
+EOF
+linux_setup vps 2 /usr/bin/node 19 | ssh vps bash -s
+
 echo "== mini"
 MINI_HOME=$(ssh mini 'echo $HOME') # launchd needs absolute paths
 ship mini darwin-arm64
 mini_setup | ssh mini bash -s
-
-echo "== vps"
-ship vps linux-arm64
-linux_setup vps 2 /usr/bin/node 19 | ssh vps bash -s
 
 echo "== pc (WSL)"
 ship pc linux-amd64 "$WSL"

@@ -63,21 +63,32 @@ cd workers/rust && cargo run --release -- --coordinator http://localhost:8080 --
 
 ## Flotte (Tailscale)
 
+```
+visiteur → https://race.kevinlemniai.fr → Caddy (VPS) → coordinateur, écoute publique (loopback)
+workers (mini, PC + GPU, MacBook, VPS) → Tailscale → coordinateur, écoute privée
+coordinateur → relais Wake-on-LAN (mini, sur le LAN) → magic packet → PC
+```
+
 | Machine | Rôle | Services |
 |---|---|---|
-| mini | coordinateur (IP Tailscale, port 8787) + workers | launchd `dev.render-race.*` |
-| vps | workers, `Nice=19` pour laisser la priorité aux sites | systemd `render-race-*` |
-| pc | workers dans WSL | systemd `render-race-*`, WSL gardé allumé |
+| vps | coordinateur + workers (`Nice=19`, les sites gardent la priorité) | systemd `render-race-*` |
+| mini | relais Wake-on-LAN + workers | launchd `dev.render-race.*` |
+| pc | workers CPU + GPU (CUDA) dans WSL | systemd `render-race-*`, WSL gardé allumé |
 | macbook | workers à la demande | `scripts/fleet.sh macbook start` |
 
-La config de la flotte (IP Tailscale du coordinateur, adresses MAC pour le
-Wake-on-LAN) est dans `fleet.env`, non versionné : copier `fleet.env.example`.
+Le coordinateur a deux écoutes séparées : la **privée** (Tailscale uniquement) sert
+les workers, le réveil et les courses sans limite ; la **publique** (derrière Caddy)
+ne sert que la page et des courses plafonnées (1080p, 64 spp, 65 536 itérations,
+une course à la fois, 20 s entre deux courses par IP).
+
+La config de la flotte (IP Tailscale, adresses MAC) est dans `fleet.env`, non
+versionné : copier `fleet.env.example`.
 
 ```
 scripts/build.sh      # cross-compile tout (Go natif, Rust via cargo-zigbuild)
 scripts/deploy.sh     # build + envoi + (re)démarrage des services
 scripts/fleet.sh status
-RENDER_RACE_COORDINATOR=http://mini:8787 node scripts/race.mjs --by machine --lang rust
+RENDER_RACE_COORDINATOR=https://race.kevinlemniai.fr node scripts/race.mjs --by machine --lang rust
 ```
 
-Interface : `http://<coordinateur>:8787`
+Démo : https://race.kevinlemniai.fr

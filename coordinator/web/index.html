@@ -39,9 +39,31 @@
         </select>
       </label>
       <label class="field">
-        <span>Lieu</span>
-        <select id="preset"></select>
+        <span>Calcul</span>
+        <select id="kind">
+          <option value="mandelbrot">Mandelbrot</option>
+          <option value="pathtrace">Path tracer 3D</option>
+        </select>
       </label>
+      <div id="mandel-controls">
+        <label class="field">
+          <span>Lieu</span>
+          <select id="preset"></select>
+        </label>
+      </div>
+      <div id="path-controls" hidden>
+        <label class="field">
+          <span>Scène</span>
+          <select id="scene">
+            <option value="marbles">Billes (Ray Tracing in One Weekend)</option>
+            <option value="trio">Trois sphères</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Échantillons par pixel <output id="spp-out"></output></span>
+          <input id="spp" type="range" min="0" max="9" step="1" value="4">
+        </label>
+      </div>
       <div class="row">
         <label class="field">
           <span>Résolution</span>
@@ -63,7 +85,7 @@
           </select>
         </label>
       </div>
-      <label class="field">
+      <label class="field" id="iter-field">
         <span>Itérations max <output id="iter-out"></output></span>
         <input id="max-iter" type="range" min="6" max="17" step="0.5" value="10">
       </label>
@@ -94,7 +116,7 @@
 
   <main class="stage">
     <div id="lanes" class="lanes"></div>
-    <p class="stage-hint">Clic : zoom ×4 · Maj + clic : dézoom</p>
+    <p class="stage-hint" id="stage-hint">Clic : zoom ×4 · Maj + clic : dézoom</p>
   </main>
 </body>
 </html>

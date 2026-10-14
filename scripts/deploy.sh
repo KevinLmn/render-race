@@ -2,7 +2,7 @@
 # Ships dist/ to the fleet and (re)starts everything as services:
 #   mini  coordinator + rust/go/js workers (launchd)
 #   vps   rust/go/js workers, niced so the websites keep priority (systemd)
-#   pc    rust/go/js workers inside WSL (systemd)
+#   pc    rust/go/js workers + the CUDA worker inside WSL (systemd)
 # The MacBook runs its workers on demand: scripts/fleet.sh macbook start
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -101,3 +101,26 @@ linux_setup vps 2 /usr/bin/node 19 | ssh vps bash -s
 echo "== pc (WSL)"
 ship pc linux-amd64 "$WSL"
 linux_setup pc 32 '$HOME/.local/node/bin/node' 0 | ssh pc "$WSL bash -s"
+# GPU worker: Python + CuPy from the venv in ~/render-race/gpu-venv.
+ssh pc "$WSL bash -s" <<'EOF'
+set -euo pipefail
+sudo tee /etc/systemd/system/render-race-cuda.service >/dev/null <<UNIT
+[Unit]
+Description=render-race CUDA worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$(id -un)
+ExecStart=$HOME/render-race/gpu-venv/bin/python $HOME/render-race/worker-cuda.py --coordinator http://100.64.0.1:8787 --machine pc --threads 16
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet render-race-cuda
+sudo systemctl restart render-race-cuda
+systemctl is-active render-race-cuda
+EOF

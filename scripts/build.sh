@@ -23,5 +23,6 @@ echo "$TARGETS" | while read -r platform goos goarch target; do
   fi
   cp "workers/rust/target/$target/release/worker-rust" "$out/"
   cp workers/js/worker.mjs "$out/"
+  [[ $platform == linux-amd64 ]] && cp workers/cuda/worker.py "$out/worker-cuda.py"
   echo "built $out"
 done

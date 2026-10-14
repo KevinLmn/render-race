@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	// A tile not returned within tileTimeout goes back to the queue: a worker
-	// that dies mid-render only costs the tiles it was holding.
-	tileTimeout = 10 * time.Second
+	// A tile not returned in time goes back to the queue: a worker that dies
+	// mid-render only costs the tiles it was holding. The deadline is the larger
+	// of tileTimeout and a multiple of the worker's average tile time, so heavy
+	// tiles on a slow machine are not taken away while still being computed.
+	tileTimeout      = 30 * time.Second
+	tileTimeoutRatio = 4
 	// Workers long-poll for tiles; an idle poll returns empty after pollTimeout.
 	pollTimeout = 15 * time.Second
 	// A worker with no poll for this long is shown as offline.
@@ -35,12 +38,16 @@ type MandelbrotParams struct {
 	MaxIter int     `json:"maxIter"`
 }
 
-// ImageSpec is the image every lane of a race renders.
+// ImageSpec is the image every lane of a race renders: a Mandelbrot view or a
+// path-traced scene. Clients send pathTrace; the coordinator fills in scene.
 type ImageSpec struct {
-	Width    int              `json:"width"`
-	Height   int              `json:"height"`
-	TileSize int              `json:"tileSize"`
-	Params   MandelbrotParams `json:"params"`
+	Kind      string            `json:"kind"`
+	Width     int               `json:"width"`
+	Height    int               `json:"height"`
+	TileSize  int               `json:"tileSize"`
+	Params    *MandelbrotParams `json:"params,omitempty"`
+	PathTrace *PathTraceRequest `json:"pathTrace,omitempty"`
+	Scene     *Scene            `json:"scene,omitempty"`
 }
 
 type LaneSpec struct {
@@ -55,18 +62,40 @@ type RaceSpec struct {
 	Lanes []LaneSpec `json:"lanes"`
 }
 
-func (s RaceSpec) validate() error {
+// prepare validates the spec and, for path tracing, builds the scene.
+func (s *RaceSpec) prepare() error {
 	switch {
 	case s.Width < 64 || s.Width > 3840 || s.Height < 64 || s.Height > 2160:
 		return errors.New("resolution must be between 64x64 and 3840x2160")
 	case s.TileSize < 32 || s.TileSize > 512:
 		return errors.New("tile size must be between 32 and 512")
-	case s.Params.MaxIter < 1 || s.Params.MaxIter > 1_000_000:
-		return errors.New("maxIter must be between 1 and 1000000")
-	case !(s.Params.Scale > 0) || math.IsInf(s.Params.Scale, 0):
-		return errors.New("scale must be a positive number")
 	case len(s.Lanes) < 1 || len(s.Lanes) > maxLanes:
 		return errors.New("a race needs between 1 and 8 lanes")
+	}
+	switch s.Kind {
+	case "mandelbrot", "":
+		s.Kind = "mandelbrot"
+		p := s.Params
+		switch {
+		case p == nil:
+			return errors.New("mandelbrot needs params")
+		case p.MaxIter < 1 || p.MaxIter > 1_000_000:
+			return errors.New("maxIter must be between 1 and 1000000")
+		case !(p.Scale > 0) || math.IsInf(p.Scale, 0):
+			return errors.New("scale must be a positive number")
+		}
+		s.PathTrace, s.Scene = nil, nil
+	case "pathtrace":
+		if s.PathTrace == nil {
+			return errors.New("pathtrace needs pathTrace settings")
+		}
+		scene, err := buildScene(*s.PathTrace, s.Width, s.Height)
+		if err != nil {
+			return err
+		}
+		s.Params, s.Scene = nil, scene
+	default:
+		return errors.New("kind must be mandelbrot or pathtrace")
 	}
 	for _, l := range s.Lanes {
 		if len(l.Workers) == 0 {
@@ -77,17 +106,20 @@ func (s RaceSpec) validate() error {
 }
 
 // Tile is what a worker receives: everything needed to render it, no shared state.
+// Mandelbrot tiles return one u32 iteration count per pixel, path-traced tiles
+// one RGBA8 pixel: 4 bytes per pixel either way.
 type Tile struct {
-	JobID  int              `json:"jobId"`
-	ID     int              `json:"tileId"`
-	Kind   string           `json:"kind"`
-	X      int              `json:"x"`
-	Y      int              `json:"y"`
-	W      int              `json:"w"`
-	H      int              `json:"h"`
-	Width  int              `json:"width"`
-	Height int              `json:"height"`
-	Params MandelbrotParams `json:"params"`
+	JobID  int               `json:"jobId"`
+	ID     int               `json:"tileId"`
+	Kind   string            `json:"kind"`
+	X      int               `json:"x"`
+	Y      int               `json:"y"`
+	W      int               `json:"w"`
+	H      int               `json:"h"`
+	Width  int               `json:"width"`
+	Height int               `json:"height"`
+	Params *MandelbrotParams `json:"params,omitempty"`
+	Scene  *Scene            `json:"scene,omitempty"`
 }
 
 type Worker struct {
@@ -151,21 +183,21 @@ func (r *Race) tile(jobID, id int) Tile {
 	ts := r.Spec.TileSize
 	x, y := (id%r.Cols)*ts, (id/r.Cols)*ts
 	return Tile{
-		JobID: jobID, ID: id, Kind: "mandelbrot",
+		JobID: jobID, ID: id, Kind: r.Spec.Kind,
 		X: x, Y: y, W: min(ts, r.Spec.Width-x), H: min(ts, r.Spec.Height-y),
-		Width: r.Spec.Width, Height: r.Spec.Height, Params: r.Spec.Params,
+		Width: r.Spec.Width, Height: r.Spec.Height, Params: r.Spec.Params, Scene: r.Spec.Scene,
 	}
 }
 
 func (j *Job) done() bool { return j.doneCount == j.race.Total }
 
 type Scheduler struct {
-	mu        sync.Mutex
-	hub       *Hub
-	race      *Race
-	jobs      map[int]*Job
-	nextID    int
-	workers   map[string]*Worker
+	mu      sync.Mutex
+	hub     *Hub
+	race    *Race
+	jobs    map[int]*Job
+	nextID  int
+	workers map[string]*Worker
 	// Closed and replaced on every state change, to wake up long-polling workers.
 	changed chan struct{}
 }
@@ -185,7 +217,7 @@ func (s *Scheduler) notifyLocked() {
 }
 
 func (s *Scheduler) StartRace(spec RaceSpec) (*Race, error) {
-	if err := spec.validate(); err != nil {
+	if err := spec.prepare(); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -290,7 +322,11 @@ func (s *Scheduler) assignLocked(workerID string) (Tile, bool) {
 		}
 		id := j.pending[0]
 		j.pending = j.pending[1:]
-		j.inflight[id] = assignment{worker: workerID, deadline: time.Now().Add(tileTimeout)}
+		timeout := tileTimeout
+		if st := j.stats[workerID]; st != nil && st.Tiles > 0 {
+			timeout = max(timeout, time.Duration(st.ComputeNs/int64(st.Tiles))*tileTimeoutRatio)
+		}
+		j.inflight[id] = assignment{worker: workerID, deadline: time.Now().Add(timeout)}
 		return s.race.tile(j.ID, id), true
 	}
 	return Tile{}, false

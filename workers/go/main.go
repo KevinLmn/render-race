@@ -28,12 +28,13 @@ type Tile struct {
 	H      int    `json:"h"`
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
-	Params struct {
+	Params *struct {
 		CenterX float64 `json:"centerX"`
 		CenterY float64 `json:"centerY"`
 		Scale   float64 `json:"scale"`
 		MaxIter uint32  `json:"maxIter"`
 	} `json:"params"`
+	Scene *Scene `json:"scene"`
 }
 
 type config struct {
@@ -78,22 +79,35 @@ func workLoop(client *http.Client, cfg config) {
 		if tile == nil {
 			continue // poll timed out with no work
 		}
-		if tile.Kind != "mandelbrot" {
+		started := time.Now()
+		var pixels []byte
+		switch {
+		case tile.Kind == "mandelbrot" && tile.Params != nil:
+			pixels = renderMandelbrot(tile)
+		case tile.Kind == "pathtrace" && tile.Scene != nil:
+			pixels = renderPathTrace(tile.Scene, tile)
+		default:
 			log.Printf("unsupported tile kind %s", tile.Kind)
 			continue
 		}
-
-		started := time.Now()
-		pixels := renderMandelbrot(tile)
 		computeNs := time.Since(started).Nanoseconds()
 
-		url := fmt.Sprintf("%s/api/worker/result?job=%d&tile=%d", cfg.coordinator, tile.JobID, tile.ID)
+		sendResult(client, cfg, tile, pixels, computeNs)
+	}
+}
+
+// A network blip must not cost the tile: retry before giving up (the
+// coordinator would only hand it out again after its timeout).
+func sendResult(client *http.Client, cfg config, tile *Tile, pixels []byte, computeNs int64) {
+	url := fmt.Sprintf("%s/api/worker/result?job=%d&tile=%d", cfg.coordinator, tile.JobID, tile.ID)
+	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(pixels))
 		req.Header.Set("X-Worker-Id", cfg.id)
 		req.Header.Set("X-Compute-Ns", strconv.FormatInt(computeNs, 10))
 		res, err := client.Do(req)
 		if err != nil {
-			log.Printf("failed to send tile %d: %v", tile.ID, err)
+			log.Printf("failed to send tile %d (attempt %d): %v", tile.ID, attempt, err)
+			time.Sleep(time.Second)
 			continue
 		}
 		res.Body.Close()
@@ -101,6 +115,7 @@ func workLoop(client *http.Client, cfg config) {
 		if res.StatusCode != http.StatusNoContent && res.StatusCode != http.StatusGone {
 			log.Printf("tile %d rejected: %s", tile.ID, res.Status)
 		}
+		return
 	}
 }
 

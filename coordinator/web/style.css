@@ -154,3 +154,5 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   .stage { height: auto; padding: 16px; }
   .lanes { grid-template-columns: 1fr; grid-template-rows: none; }
 }
+
+[hidden] { display: none !important; }

@@ -9,6 +9,7 @@ rendue.
 
 - `coordinator/` (Go) : file de tuiles, long-poll HTTP pour les workers,
   WebSocket vers le navigateur, interface web embarquée.
+- `workers/cuda/` : Python + CuPy, kernels CUDA compilés à la volée (NVRTC).
 - `workers/{rust,go,js}/` : même algorithme dans les trois langages. Un thread
   (goroutine, worker_thread) par cœur, chacun tire une tuile, la calcule, renvoie le résultat.
 
@@ -23,6 +24,23 @@ les mêmes octets.
   d'1 ULP : en zoom profond, ça décale des pixels. Feature `float_roundtrip`.
 - **Go** peut fusionner `a*b+c` en une instruction FMA (arrondi unique) sur arm64.
   Les conversions explicites `float64(...)` l'en empêchent (préventif, d'après la spec).
+- **CUDA** fusionne `a*b+c` par défaut : kernels compilés avec `--fmad=false`.
+- Le path tracer n'utilise que `+ - * /` et `sqrt` (arrondis exacts IEEE 754), un
+  RNG entier 32 bits, et un ordre d'opérations figé : Rust, Go, JS et le GPU
+  produisent les mêmes octets. La caméra (qui a besoin de `tan`) est calculée par
+  le coordinateur.
+
+## Perf : ce qu'on a appris
+
+- **Go, vecteurs en `[3]float64`** : 5× plus lent que Rust. L'ABI registre de Go
+  passe les petites structs dans les registres mais pas les tableaux. Passage à
+  `struct{X, Y, Z}` : 155 → 70 ms/tuile, puis pointeur vers la sphère au lieu de
+  scène + index : 61 ms (Rust : 31 ms).
+- **GPU** : en tuiles de 64 px, un kernel n'a que 4096 pixels, le 4090 attend le
+  réseau et perd contre Rust. En 256 px, il gagne (×1,7). En `f64` (requis pour
+  être identique aux CPU), le 4090 tourne à 1/64 de sa vitesse `f32`.
+- Courses sur une même machine : `--sequential`, sinon les couloirs se partagent
+  les cœurs.
 
 Les workers **tirent** le travail : les machines rapides prennent naturellement
 plus de tuiles. Une tuile non rendue en 10 s retourne dans la file, donc un

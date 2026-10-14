@@ -33,7 +33,7 @@ case "${1:-} ${2:-}" in
     echo "macbook workers started, logs in $LOGS"
     ;;
   "macbook stop")
-    pkill -f "$BIN/worker-" || true
+    pkill -f "$BIN/worker" || true # worker-rust, worker-go, worker.mjs
     echo "macbook workers stopped"
     ;;
   *)

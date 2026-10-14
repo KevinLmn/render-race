@@ -1,6 +1,8 @@
 //! Rust worker: one thread per core, each one pulls a tile from the
 //! coordinator, renders it and posts the result back.
 
+mod pathtrace;
+
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,7 +21,8 @@ struct Tile {
     h: u32,
     width: u32,
     height: u32,
-    params: MandelbrotParams,
+    params: Option<MandelbrotParams>,
+    scene: Option<pathtrace::Scene>,
 }
 
 #[derive(Deserialize)]
@@ -74,27 +77,42 @@ fn work_loop(agent: &ureq::Agent, config: &Config) {
                 continue;
             }
         };
-        if tile.kind != "mandelbrot" {
-            eprintln!("unsupported tile kind {}", tile.kind);
-            continue;
-        }
-
         let started = Instant::now();
-        let pixels = render_mandelbrot(&tile);
+        let pixels = match (tile.kind.as_str(), &tile.params, &tile.scene) {
+            ("mandelbrot", Some(params), _) => render_mandelbrot(&tile, params),
+            ("pathtrace", _, Some(scene)) => {
+                pathtrace::render(scene, tile.x, tile.y, tile.w, tile.h, tile.width, tile.height)
+            }
+            _ => {
+                eprintln!("unsupported tile kind {}", tile.kind);
+                continue;
+            }
+        };
         let compute_ns = started.elapsed().as_nanos();
 
         let url = format!(
             "{}/api/worker/result?job={}&tile={}",
             config.coordinator, tile.job_id, tile.tile_id
         );
-        match agent
-            .post(&url)
-            .set("X-Worker-Id", &config.id)
-            .set("X-Compute-Ns", &compute_ns.to_string())
-            .send_bytes(&pixels)
-        {
-            Ok(_) | Err(ureq::Error::Status(410, _)) => {} // 410: job replaced meanwhile
-            Err(err) => eprintln!("failed to send tile {}: {err}", tile.tile_id),
+        // A network blip must not cost the tile: retry before giving up (the
+        // coordinator would only hand it out again after its timeout).
+        for attempt in 1..=3 {
+            match agent
+                .post(&url)
+                .set("X-Worker-Id", &config.id)
+                .set("X-Compute-Ns", &compute_ns.to_string())
+                .send_bytes(&pixels)
+            {
+                Ok(_) | Err(ureq::Error::Status(410, _)) => break, // 410: job replaced meanwhile
+                Err(ureq::Error::Status(code, _)) => {
+                    eprintln!("tile {} rejected: {code}", tile.tile_id);
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("failed to send tile {} (attempt {attempt}): {err}", tile.tile_id);
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
         }
     }
 }
@@ -114,8 +132,7 @@ fn next_tile(agent: &ureq::Agent, config: &Config) -> Result<Option<Tile>, ureq:
 }
 
 /// One little-endian u32 escape iteration count per pixel, row by row.
-fn render_mandelbrot(t: &Tile) -> Vec<u8> {
-    let p = &t.params;
+fn render_mandelbrot(t: &Tile, p: &MandelbrotParams) -> Vec<u8> {
     let (half_w, half_h) = (t.width as f64 / 2.0, t.height as f64 / 2.0);
     let mut out = Vec::with_capacity((t.w * t.h * 4) as usize);
     for py in t.y..t.y + t.h {

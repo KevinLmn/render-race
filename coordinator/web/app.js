@@ -35,6 +35,14 @@ $('preset').addEventListener('change', () => {
   start()
 })
 $('max-iter').addEventListener('input', updateIterLabel)
+$('spp').addEventListener('input', updateSppLabel)
+$('kind').addEventListener('change', () => {
+  const path = $('kind').value === 'pathtrace'
+  $('mandel-controls').hidden = path
+  $('iter-field').hidden = path
+  $('path-controls').hidden = !path
+  $('stage-hint').hidden = path
+})
 $('render').addEventListener('click', start)
 $('reset').addEventListener('click', () => {
   $('preset').value = 0
@@ -49,9 +57,17 @@ function updateIterLabel() {
 }
 updateIterLabel()
 
+function spp() {
+  return 2 ** Number($('spp').value)
+}
+function updateSppLabel() {
+  $('spp-out').value = spp()
+}
+updateSppLabel()
+
 function zoomAt(e, canvas) {
   const race = state.race
-  if (!race) return
+  if (!race || race.spec.kind !== 'mandelbrot') return
   const rect = canvas.getBoundingClientRect()
   const px = ((e.clientX - rect.left) / rect.width) * race.spec.width
   const py = ((e.clientY - rect.top) / rect.height) * race.spec.height
@@ -85,13 +101,18 @@ async function start() {
       width,
       height,
       tileSize: Number($('tile-size').value),
-      params: {
-        centerX: state.view.centerX,
-        centerY: state.view.centerY,
-        scale: state.view.span / width,
-        maxIter: maxIter(),
-      },
       lanes,
+      ...($('kind').value === 'pathtrace'
+        ? { kind: 'pathtrace', pathTrace: { preset: $('scene').value, spp: spp(), maxDepth: 10 } }
+        : {
+            kind: 'mandelbrot',
+            params: {
+              centerX: state.view.centerX,
+              centerY: state.view.centerY,
+              scale: state.view.span / width,
+              maxIter: maxIter(),
+            },
+          }),
     }),
   })
   if (!res.ok) flashButton(await res.text())
@@ -160,10 +181,12 @@ function onWorkers(workers) {
 function onRace(race) {
   state.race = race
   const { width, height, params } = race.spec
-  state.lut = buildLut(params.maxIter)
-  state.view.centerX = params.centerX
-  state.view.centerY = params.centerY
-  state.view.span = params.scale * width
+  if (params) {
+    state.lut = buildLut(params.maxIter)
+    state.view.centerX = params.centerX
+    state.view.centerY = params.centerY
+    state.view.span = params.scale * width
+  }
 
   const container = $('lanes')
   const cols = race.lanes.length === 1 ? 1 : race.lanes.length <= 4 ? 2 : race.lanes.length <= 6 ? 3 : 4
@@ -185,6 +208,7 @@ function onRace(race) {
         c.height = height
       }
       image.addEventListener('click', (e) => zoomAt(e, image))
+      image.style.cursor = race.spec.kind === 'mandelbrot' ? 'zoom-in' : 'default'
       const ctx = image.getContext('2d')
       const imageData = ctx.createImageData(width, height)
       const pixels = new Uint32Array(imageData.data.buffer)
@@ -216,20 +240,28 @@ function onTile(buffer) {
   if (!race || !lane) return
   const tileId = head.getUint32(4, true)
   const workerIndex = head.getUint16(8, true)
-  const counts = new Uint32Array(buffer, 12)
 
   const ts = race.spec.tileSize
   const x = (tileId % race.cols) * ts
   const y = Math.floor(tileId / race.cols) * ts
   const w = Math.min(ts, race.spec.width - x)
   const h = Math.min(ts, race.spec.height - y)
-  const { pixels } = lane
-  const lut = state.lut
   const stride = race.spec.width
-  for (let row = 0; row < h; row++) {
-    const src = row * w
-    const dst = (y + row) * stride + x
-    for (let col = 0; col < w; col++) pixels[dst + col] = lut[counts[src + col]]
+  if (race.spec.kind === 'pathtrace') {
+    // Already RGBA8: copy row by row.
+    const rgba = new Uint8Array(buffer, 12)
+    const data = lane.imageData.data
+    for (let row = 0; row < h; row++) data.set(rgba.subarray(row * w * 4, (row + 1) * w * 4), ((y + row) * stride + x) * 4)
+  } else {
+    // Iteration counts: color them through the palette.
+    const counts = new Uint32Array(buffer, 12)
+    const { pixels } = lane
+    const lut = state.lut
+    for (let row = 0; row < h; row++) {
+      const src = row * w
+      const dst = (y + row) * stride + x
+      for (let col = 0; col < w; col++) pixels[dst + col] = lut[counts[src + col]]
+    }
   }
   lane.ctx.putImageData(lane.imageData, 0, 0, x, y, w, h)
   lane.tileOwner[tileId] = workerIndex
